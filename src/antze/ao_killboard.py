@@ -2,17 +2,20 @@
 
 import dateutil.parser
 import httpx
-
+import datetime
 import argparse
 import asyncio
 import itertools
 import os
 import sys
 
+import pickle
+
 # urls
 
 URL_PLAYER = "https://albiononline.com/en/killboard/player/"
 URL_KILL   = "https://albiononline.com/en/killboard/kill/"
+URL_LEDGER = "https://murderledger.com/players/"
 URL_API    = "https://gameinfo.albiononline.com/api/gameinfo/"
 URL_EVENTS = "https://gameinfo.albiononline.com/api/gameinfo/events"
 URL_ITEM   = "https://gameinfo.albiononline.com/api/gameinfo/items/"
@@ -97,6 +100,7 @@ class Player:
         self.inventory = [Item(v) for v in j["Inventory"]]
         self.damage_done = j.get("DamageDone", None)
         self.average_item_power = j["AverageItemPower"]
+        self.url_ledger = URL_LEDGER+j["Name"]+"/ledger"
 
     @property
     def url(self):
@@ -110,6 +114,14 @@ class Player:
         if self.alliance or self.guild: v += ","
         if self.alliance: v += " [{}]".format(self.alliance)
         if self.guild: v += " {}".format(self.guild)
+        return v
+
+    def format_new(self):
+        ledger_url = "https://murderledger.com/players/{0}/ledger".format(self.name)
+        v = f"[{self.name}]({ledger_url})"
+        # if self.alliance or self.guild: v += ","
+        # if self.alliance: v += " [{}]".format(self.alliance)
+        # if self.guild: v += " {}".format(self.guild)
         return v
 
     def __eq__(self, other):
@@ -159,6 +171,7 @@ class Event:
         )
 
 def format_participant(participant, damage, type):
+
     s = "{} ({:.2f}%), IP=**{:d}**".format(
         participant.format(),
         (participant.damage_done or 0)*100.0/damage,
@@ -166,9 +179,18 @@ def format_participant(participant, damage, type):
     )
     return f"• {type}: {s}\n"
 
+def format_participant_new(participant, damage, type):
+
+    s = "{}:IP-[{:d}]- ({:.0f}%), ".format(
+        participant.format_new(),
+        int(participant.average_item_power),
+         (participant.damage_done or 0)*100.0/damage
+    )
+    return f"• {type}: {s}\n"
 def format_event(event, guild_id):
     victory = event.killer.matches(guild_id)
     victory_str = ":muscle: Victory!" if victory else ":thumbsdown: Defeat!"
+    victory_icon = "https://i.imgur.com/CeqX0CY.png" if victory else "https://albiononline.com/assets/images/killboard/kill__date.png"
 
     desc1 = ""
     damage = max(1,sum(p.damage_done for p in event.participants))
@@ -188,7 +210,7 @@ def format_event(event, guild_id):
     for p in assist:
         desc1 += format_participant(p, damage, "Assist")
 
-    desc1 += f"• **{event.fame}** fame gained"
+    # desc1 += f"• **{event.fame}** fame gained"
 
     s = "{}, IP=**{:d}**".format(
         event.victim.format(),
@@ -200,20 +222,28 @@ def format_event(event, guild_id):
     if destroyed:
         desc2 += f"• **{destroyed}** items destroyed\n"
 
+
+    # inspiration here 
+    # https://github.com/bearlikelion/ao-killbot/blob/master/ao-killbot.js#L142
     embed = {
-        "color": 0x008000 if victory else 0x800000,
+        "color": 0x00D166 if victory else 0xF93A2F,
+        "author": {
+            "icon_url": victory_icon
+        },
         "title": discord.utils.escape_markdown(
-            f"{victory_str} {event.killer.name} → {event.victim.name}"
+            f"{victory_str} {event.killer.name} killed {event.victim.name}"
         ),
         "url": event.url,
         "fields": [
             {
                 "name": "Attacking",
-                "value": desc1
+                "value": desc1,
+                "inline": True,
             },
             {
                 "name": "Defending",
-                "value": desc2
+                "value": desc2,
+                "inline": True,
             }
         ],
         "footer": {
@@ -225,6 +255,114 @@ def format_event(event, guild_id):
         embed["thumbnail"] = {
             "url": URL_ITEM+event.killer.equipment.main_hand.type
         }
+
+
+
+    return embed
+
+    # embed = {
+    #     "color": 0x00D166 if victory else 0xF93A2F,
+    #     "author": {
+    #         "icon_url": victory_icon
+    #     },
+    #     "title": discord.utils.escape_markdown(
+    #         f"{victory_str} {event.killer.name} killed {event.victim.name}"
+    #     ),
+    #     "url": event.url,
+    #     "footer": {
+    #         "text": "Kill #" + str(event.id)
+    #     },
+    #     "timestamp": event.time.isoformat()
+    # }
+    # embed.add_field(name="Attacking", value=desc1, inline=True)
+    # embed.add_field(name="Defending", value=desc2, inline=True)
+    # if event.killer.equipment.main_hand:
+    #     embed["thumbnail"] = {
+    #         "url": URL_ITEM+event.killer.equipment.main_hand.type
+    #     }
+
+    # return embed
+def format_event_new(event, guild_id):
+    # https://autocode.com/tools/discord/embed-builder/
+    # https://cog-creators.github.io/discord-embed-sandbox/
+    embed=discord.Embed()
+    desc1 =""
+    victory = event.killer.matches(guild_id)
+    victory_str = ":muscle: Victory!" if victory else ":thumbsdown: Defeat!"
+    victory_icon = "https://i.imgur.com/CeqX0CY.png" if victory else "https://albiononline.com/assets/images/killboard/kill__date.png"
+    section_killer_guild = ""
+    section_victim_guild = ""
+    section_damages = ""
+    
+    damage = max(1,sum(p.damage_done for p in event.participants))
+    assist = []
+    killer_found = False
+    section_damages=""
+    for p in event.participants:
+        if p == event.killer:          
+            killer_found = True
+            killer_alliance =  f'[{event.killer.alliance}]-' if repr(event.killer.alliance) != "<PlayerAlliance(None)>" else""
+            killer_guild = event.killer.guild if event.killer.guild != "<PlayerGuild(None)>" else "EMPTY" 
+            if killer_guild == "EMPTY":
+                section_killer_guild = "no guild"  
+            else:
+                section_killer_guild = "{0}{1}".format(killer_alliance,killer_guild)                
+            section_damages += format_participant_new(p, damage, "K")
+        else:
+            assist.append(p)
+
+    victim_alliance =  f'[{event.victim.alliance}]-' if repr(event.victim.alliance) != "<PlayerAlliance(None)>" else""
+    victim_guild = event.victim.guild if event.victim.guild != "<PlayerGuild(None)>" else "EMPTY"   
+    if victim_guild == "EMPTY":
+        section_victim_guild = "no guild"  
+    else:
+        section_victim_guild = "{0}{1}".format(victim_alliance,victim_guild)    
+
+    assist.sort(key=lambda p: p.damage_done, reverse=True)
+    for p in assist:
+        section_damages += format_participant_new(p, damage, "A")
+    
+    section_destroyed_items = ''
+    destroyed = sum(1 for item in event.victim.inventory if item)
+    if destroyed:
+        section_destroyed_items += f"• **{destroyed}** items destroyed\n"
+    else:
+        section_destroyed_items = 'None'
+
+
+    title = "{0} just ganked {1}" .format(event.killer.name,event.victim.name)
+    description_assist =  "Assisted by "+str(len(assist))+" player" if len(assist) >0 else  "Solo kill"
+    color =  0x08f700 if victory else 0xF93A2F
+    icon_url = "https://render.albiononline.com/v1/spell/Ghost%20Strike.png" if victory else "https://render.albiononline.com/v1/spell/Death%20Curse.png"
+    embed=discord.Embed(
+        title=title,
+        url=event.url,
+        color=color,
+        timestamp=event.time
+        )
+    
+    # # embed.set_thumbnail(url="https://i.imgur.com/CeqX0CY.png")
+    # # jesus
+    # embed.set_thumbnail(url="https://www.meme-arsenal.com/memes/9e37cdd5db9ad2b0d0a4a94964cc3526.jpg")
+    # # yoda
+    # embed.set_thumbnail(url="https://www.meme-arsenal.com/memes/7fe845da84dc5ded4ce20faa4ad269f4.jpg")
+    # # albion icon skulls red
+    # embed.set_thumbnail(url="https://render.albiononline.com/v1/spell/Death%20Curse.png")
+    # # albion icon skulls green    
+    # embed.set_thumbnail(url="https://i.pinimg.com/564x/e0/a8/f8/e0a8f89336f1e7fe55aeb88665786416.jpg")
+
+    embed.set_thumbnail(url=icon_url)
+    
+    embed.add_field(name="Kill type", value=description_assist, inline=False)
+    if section_killer_guild =="" :
+        section_killer_guild ="none"
+    if section_victim_guild =="" :
+        section_victim_guild ="none"        
+    embed.add_field(name=event.killer.name, value=section_killer_guild, inline=True)
+    embed.add_field(name=event.victim.name, value=section_victim_guild, inline=True)
+    embed.add_field(name="Damages : ", value=section_damages, inline=False)
+    embed.add_field(name="Items destroyed : ", value=section_destroyed_items, inline=False)
+    
     return embed
 
 def format_bytesize(num):
@@ -241,7 +379,7 @@ async def get_events(url, client, log, num=51, print_events=False, tip_time=None
     r = f"{url}?limit={num:d}"
     if log: log.debug(f"GET {r}")
     try:
-        r = await client.get(r)
+        r = await client.get(r, timeout=None)
         if r.status_code != 200:
             return None
     except httpx.ConnectTimeout:
@@ -434,11 +572,20 @@ class AOKillboardCog(discord.ext.commands.Cog):
         tip_time = None
         while True:
             try:
-                events = await get_events(URL_EVENTS, client, log,
+                if cog_args.debug is True:
+                    with open("dict.pickle", 'rb') as file:
+                        try:
+                            while True:
+                                log.debug("loading events from Pickle")
+                                events = pickle.load(file)
+                        except EOFError:
+                            pass
+                else:
+                    events = await get_events(URL_EVENTS, client, log,
                                           num=50,
                                           tip_time=tip_time)
                 if events:
-                    if tip_time is None:
+                    if tip_time is None and  cog_args.debug is False:
                         # don't announce anything on first successful request
                         tip_time = events[-1].time
                         log.debug("first successful request, "
@@ -472,9 +619,12 @@ class AOKillboardCog(discord.ext.commands.Cog):
                                                           exc_info[1]))
                 else:
                     log.debug("events: new = 0, matching = 0")
+					
             except httpx.TimeoutException:
                 await asyncio.sleep(retry)
-                log.debug(f"waiting for {retry}s")
+                #log.debug(f"waiting for {retry}s")
+                log.debug(f"TimeoutException - waiting for {retry}s")
+                sys.stdout.flush()
                 retry = min(retry + retry_base, cog_args.interval)
                 continue
             except asyncio.CancelledError:
@@ -484,7 +634,8 @@ class AOKillboardCog(discord.ext.commands.Cog):
                 log.error("{}: {}".format(exc_info[0].__name__,
                                           exc_info[1]))
             retry = retry_base
-            log.debug(f"waiting for {cog_args.interval}s")
+            log.debug(f"End of loop - waiting for {cog_args.interval}s")
+            sys.stdout.flush()
             await asyncio.sleep(cog_args.interval)
 
     def filter(self, events):
@@ -493,16 +644,36 @@ class AOKillboardCog(discord.ext.commands.Cog):
     async def announce(self, channel, events, log):
         if not events:
             return
-        log.debug("events: sending to channel {}".format(channel.id))
+        log.debug("events: sending to channel {0}".format(channel.id))
+        # pickle_out = open("dict.pickle","wb")
+        # pickle.dump(events, pickle_out)
+        # pickle_out.close()
+        # for e_rpr in events:
+        #     print (repr(e_rpr))
         for e in events:
-            embed = discord.Embed.from_dict(format_event(e, cog_args.guild))
-            await channel.send(embed=embed)
+            # embed = discord.Embed.from_dict(format_event(e, cog_args.guild))
+            # log.debug("processing event id {0}",format(e.id))
+            
+            if cog_args.debug is True:
+                if (e.id == 333551810):
+                    continue
+                else:
+                    embed = format_event_new(e, cog_args.guild)
+                    # embed = discord.Embed.from_dict(format_event(e, cog_args.guild))
+                    await channel.send(embed=embed)
+                sys.exit(1)
+            else:
+                embed = format_event_new(e, cog_args.guild)
+                await channel.send(embed=embed)    
 
     def matches(self, event):
-        return (
-            event.killer.matches(cog_args.guild) or
-            event.victim.matches(cog_args.guild)
-        )
+        if cog_args.debug is True:
+            return True
+        else:
+            return (
+                event.killer.matches(cog_args.guild) or
+                event.victim.matches(cog_args.guild)
+            )
 
 def setup(bot):
     # initial logging setup
@@ -521,7 +692,10 @@ def setup(bot):
     log.setLevel(logging.DEBUG if cog_args.debug else logging.INFO)
 
     # launch cog
-
+    # if cog_args.debug == True:
+    #     cog_args.guild = "yM8btgK-S06oqoOPp5Ewow"
+    #     cog_args.channel = 904385508577255434
+    #     cog_args.token  = "NzQ5MzY4ODMwMTkwNjgyMjMy.X0q-Gw.2fr7N2JHpSdtU6-kYYUgAwH7aDY"
     assert_not_none(cog_args.guild, "GUILD")
     assert_not_none(cog_args.channel, "CHANNEL")
     bot.add_cog(AOKillboardCog(bot))    
